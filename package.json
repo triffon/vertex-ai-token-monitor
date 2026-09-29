@@ -1,0 +1,69 @@
+{
+  "name": "vertex-ai-token-monitor",
+  "displayName": "Vertex AI Token Monitor",
+  "description": "Shows today's Vertex AI publisher-model input/output token usage in the VS Code status bar using Google Cloud Monitoring.",
+  "version": "0.1.0",
+  "publisher": "ttrifonov",
+  "license": "MIT",
+  "engines": {
+    "vscode": ">=1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "vertex ai",
+    "tokens",
+    "google cloud",
+    "monitoring",
+    "antigravity"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:vertexTokenMonitor.refresh",
+    "onCommand:vertexTokenMonitor.showDetails"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "vertexTokenMonitor.refresh",
+        "title": "Vertex Token Monitor: Refresh"
+      },
+      {
+        "command": "vertexTokenMonitor.showDetails",
+        "title": "Vertex Token Monitor: Show Details"
+      }
+    ],
+    "configuration": {
+      "title": "Vertex AI Token Monitor",
+      "properties": {
+        "vertexTokenMonitor.projectId": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Google Cloud project ID. Leave blank to use the active project from `gcloud config get-value project`."
+        },
+        "vertexTokenMonitor.refreshMinutes": {
+          "type": "number",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 1440,
+          "description": "Automatic refresh interval in minutes."
+        },
+        "vertexTokenMonitor.gcloudPath": {
+          "type": "string",
+          "default": "gcloud",
+          "markdownDescription": "Path or command name for the Google Cloud CLI. On Windows, plain `gcloud` is automatically changed to `gcloud.cmd`."
+        },
+        "vertexTokenMonitor.extraFilter": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Optional additional Cloud Monitoring filter appended to the Vertex token metric filter. Example: `resource.labels.model_user_id=\"gemini-2.5-pro\"`. Leave blank to count all Vertex publisher-model traffic in the project."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "package": "npx --yes @vscode/vsce package"
+  }
+}
