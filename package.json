@@ -2,7 +2,7 @@
   "name": "vertex-ai-token-monitor",
   "displayName": "Vertex AI Token Monitor",
   "description": "Shows today's Vertex AI publisher-model input/output token usage in the VS Code status bar using Google Cloud Monitoring.",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "publisher": "triffon",
   "license": "MIT",
   "repository": {
@@ -58,6 +58,21 @@
           "type": "string",
           "default": "gcloud",
           "markdownDescription": "Path or command name for the Google Cloud CLI. On Windows, plain `gcloud` is automatically changed to `gcloud.cmd`."
+        },
+        "vertexTokenMonitor.billingExportTable": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Fully qualified BigQuery table of the Cloud Billing export, e.g. `my-billing-project.billing.gcp_billing_export_v1_XXXXXX_XXXXXX_XXXXXX`. When set, actual costs (today and month-to-date) are shown. Leave blank to disable. The export lags real time by hours."
+        },
+        "vertexTokenMonitor.billingQueryProjectId": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Project in which the BigQuery billing query job runs (and is billed). Leave blank to use the monitored project."
+        },
+        "vertexTokenMonitor.billingServiceDescription": {
+          "type": "string",
+          "default": "Vertex AI",
+          "markdownDescription": "Only count billing rows whose `service.description` equals this value. Leave blank to include every service in the project."
         },
         "vertexTokenMonitor.extraFilter": {
           "type": "string",

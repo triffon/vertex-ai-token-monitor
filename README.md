@@ -64,7 +64,10 @@ Command Palette commands:
   "vertexTokenMonitor.projectId": "my-project-id",
   "vertexTokenMonitor.refreshMinutes": 5,
   "vertexTokenMonitor.gcloudPath": "gcloud",
-  "vertexTokenMonitor.extraFilter": ""
+  "vertexTokenMonitor.extraFilter": "",
+  "vertexTokenMonitor.billingExportTable": "my-billing-project.billing.gcp_billing_export_v1_XXXXXX_XXXXXX_XXXXXX",
+  "vertexTokenMonitor.billingQueryProjectId": "",
+  "vertexTokenMonitor.billingServiceDescription": "Vertex AI"
 }
 ```
 
@@ -82,6 +85,20 @@ For example, after verifying the exact resource label value in Metrics Explorer:
 
 Do not assume this can isolate Antigravity specifically: the documented token metric does not provide an Antigravity-client/session label.
 
+## Actual cost from Cloud Billing (optional)
+
+Token counts come from Cloud Monitoring and are near real time. Actual **cost** is different: Cloud Billing has no "current spend" API, so the extension reads the [Cloud Billing export to BigQuery](https://cloud.google.com/billing/docs/how-to/export-data-bigquery). That export lags real time by hours, so treat cost as a delayed but authoritative figure.
+
+Setup:
+
+1. Enable **Standard usage cost** export to BigQuery for your billing account (Billing → Billing export). Data only appears from the time the export is enabled.
+2. Set `vertexTokenMonitor.billingExportTable` to the full table name (`PROJECT.DATASET.gcp_billing_export_v1_...`).
+3. Make sure your account has `roles/bigquery.jobUser` on the project where the query runs (the monitored project by default, or `vertexTokenMonitor.billingQueryProjectId`) and `roles/bigquery.dataViewer` on the export dataset.
+
+When configured, the status bar appends the month-to-date cost (`Vertex: 1.4M in / 84.2K out · $12.34 MTD`) and the tooltip shows today's cost, month-to-date cost (net of credits, with the pre-credit amount when different) and how recent the exported billing data is. Rows are filtered to the monitored project and to `service.description = "Vertex AI"` (change or clear with `vertexTokenMonitor.billingServiceDescription`). If the billing query fails, the token counts still display and the error appears in the tooltip.
+
+The month boundary uses local time; invoices use Pacific time, so figures near month boundaries can differ slightly.
+
 ## Day boundary
 
 "Today" is calculated from local midnight in the machine running the VS Code extension host, then converted to UTC for the Cloud Monitoring API interval.
@@ -91,7 +108,7 @@ Do not assume this can isolate Antigravity specifically: the documented token me
 The source is deliberately small. It:
 
 - runs only `gcloud config get-value project` and `gcloud auth print-access-token`;
-- sends the resulting OAuth access token only to `https://monitoring.googleapis.com`;
+- sends the resulting OAuth access token only to `https://monitoring.googleapis.com` and, if billing export is configured, `https://bigquery.googleapis.com`;
 - makes no other network requests;
 - reads no workspace files or Antigravity files;
 - has no runtime third-party dependencies.

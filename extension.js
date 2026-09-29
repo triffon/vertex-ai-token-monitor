@@ -64,7 +64,11 @@ async function refresh(notifyOnError) {
   try {
     const projectId = await resolveProjectId();
     const accessToken = await getAccessToken();
-    const usage = await queryTodayUsage(projectId, accessToken);
+    const [usage, billing] = await Promise.all([
+      queryTodayUsage(projectId, accessToken),
+      queryBillingSafe(projectId, accessToken)
+    ]);
+    usage.billing = billing;
     latestUsage = usage;
     renderUsage(usage);
   } catch (error) {
@@ -214,6 +218,111 @@ async function queryTodayUsage(projectId, accessToken) {
   };
 }
 
+// Billing failures must never hide the token counts, so they are captured instead of thrown.
+async function queryBillingSafe(projectId, accessToken) {
+  try {
+    return await queryBilling(projectId, accessToken);
+  } catch (error) {
+    error.source = 'billing';
+    const message = friendlyError(error);
+    output.appendLine(`[${new Date().toISOString()}] Cloud Billing: ${message}`);
+    return { error: message };
+  }
+}
+
+// Cloud Billing has no "current spend" API; actual costs are only available through the
+// Cloud Billing export to BigQuery, which lags behind real time by hours.
+async function queryBilling(projectId, accessToken) {
+  const config = getConfig();
+  const table = String(config.get('billingExportTable', '') || '').trim();
+  if (!table) {
+    return undefined;
+  }
+  if (!/^[A-Za-z0-9_.:-]+$/.test(table) || table.split(/[.:]/).length < 3) {
+    throw new Error(
+      'vertexTokenMonitor.billingExportTable must look like PROJECT.DATASET.gcp_billing_export_v1_XXXXXX_XXXXXX_XXXXXX'
+    );
+  }
+
+  const queryProject =
+    String(config.get('billingQueryProjectId', '') || '').trim() || projectId;
+  const service = String(config.get('billingServiceDescription', 'Vertex AI') || '').trim();
+
+  const now = new Date();
+  const todayStart = new Date(now);
+  todayStart.setHours(0, 0, 0, 0);
+  const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+
+  const netCost = 'cost + IFNULL((SELECT SUM(c.amount) FROM UNNEST(credits) AS c), 0)';
+  const sql = `
+    SELECT
+      currency,
+      SUM(IF(usage_start_time >= @todayStart, ${netCost}, 0)) AS today_cost,
+      SUM(${netCost}) AS month_cost,
+      SUM(IF(usage_start_time >= @todayStart, cost, 0)) AS today_gross,
+      SUM(cost) AS month_gross,
+      MAX(usage_end_time) AS data_through
+    FROM \`${table}\`
+    WHERE usage_start_time >= @monthStart
+      AND project.id = @projectId
+      ${service ? 'AND service.description = @service' : ''}
+    GROUP BY currency
+    ORDER BY month_cost DESC`;
+
+  const param = (name, type, value) => ({
+    name,
+    parameterType: { type },
+    parameterValue: { value }
+  });
+  const queryParameters = [
+    param('todayStart', 'TIMESTAMP', todayStart.toISOString()),
+    param('monthStart', 'TIMESTAMP', monthStart.toISOString()),
+    param('projectId', 'STRING', projectId)
+  ];
+  if (service) {
+    queryParameters.push(param('service', 'STRING', service));
+  }
+
+  const url = new URL(
+    `https://bigquery.googleapis.com/bigquery/v2/projects/${encodeURIComponent(queryProject)}/queries`
+  );
+  const response = await requestJson(url, accessToken, {
+    apiName: 'BigQuery API',
+    method: 'POST',
+    body: {
+      query: sql,
+      useLegacySql: false,
+      parameterMode: 'NAMED',
+      queryParameters,
+      timeoutMs: 20000
+    }
+  });
+
+  if (response.jobComplete === false) {
+    throw new Error('BigQuery did not finish the billing query in time. It will be retried on the next refresh.');
+  }
+
+  const rows = (Array.isArray(response.rows) ? response.rows : []).map((row) => {
+    const cell = (index) => row.f?.[index]?.v;
+    const num = (index) => {
+      const value = Number(cell(index));
+      return Number.isFinite(value) ? value : 0;
+    };
+    // TIMESTAMP cells come back as seconds since the epoch, as a string.
+    const seconds = Number(cell(5));
+    return {
+      currency: cell(0) || 'USD',
+      today: num(1),
+      month: num(2),
+      todayGross: num(3),
+      monthGross: num(4),
+      dataThrough: Number.isFinite(seconds) ? new Date(seconds * 1000) : undefined
+    };
+  });
+
+  return { table, service, monthStart, rows };
+}
+
 function sumPoints(points) {
   let total = 0n;
   for (const point of Array.isArray(points) ? points : []) {
@@ -233,16 +342,27 @@ function sumPoints(points) {
 }
 
 function getJson(url, accessToken) {
+  return requestJson(url, accessToken, { apiName: 'Cloud Monitoring' });
+}
+
+function requestJson(url, accessToken, { apiName, method = 'GET', body: requestBody } = {}) {
   return new Promise((resolve, reject) => {
+    const payload = requestBody === undefined ? undefined : JSON.stringify(requestBody);
+    const headers = {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: 'application/json',
+      'User-Agent': 'vertex-ai-token-monitor-vscode/0.1.0'
+    };
+    if (payload !== undefined) {
+      headers['Content-Type'] = 'application/json';
+      headers['Content-Length'] = Buffer.byteLength(payload);
+    }
+
     const request = https.request(
       url,
       {
-        method: 'GET',
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          Accept: 'application/json',
-          'User-Agent': 'vertex-ai-token-monitor-vscode/0.1.0'
-        }
+        method,
+        headers
       },
       (response) => {
         const chunks = [];
@@ -253,13 +373,13 @@ function getJson(url, accessToken) {
           try {
             parsed = body ? JSON.parse(body) : {};
           } catch {
-            reject(new Error(`Cloud Monitoring returned invalid JSON (HTTP ${response.statusCode}).`));
+            reject(new Error(`${apiName} returned invalid JSON (HTTP ${response.statusCode}).`));
             return;
           }
 
           if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
             const apiMessage = parsed?.error?.message || body || `HTTP ${response.statusCode}`;
-            const error = new Error(`Cloud Monitoring API: ${apiMessage}`);
+            const error = new Error(`${apiName}: ${apiMessage}`);
             error.statusCode = response.statusCode;
             reject(error);
             return;
@@ -270,10 +390,13 @@ function getJson(url, accessToken) {
       }
     );
 
-    request.setTimeout(20000, () => {
-      request.destroy(new Error('Cloud Monitoring request timed out.'));
+    request.setTimeout(30000, () => {
+      request.destroy(new Error(`${apiName} request timed out.`));
     });
     request.on('error', reject);
+    if (payload !== undefined) {
+      request.write(payload);
+    }
     request.end();
   });
 }
@@ -282,7 +405,8 @@ function renderUsage(usage) {
   const { input, output: outputTokens, other } = usage.totals;
   const total = input + outputTokens + other;
 
-  statusBar.text = `$(pulse) Vertex: ${formatCompact(input)} in / ${formatCompact(outputTokens)} out`;
+  const cost = usage.billing?.rows?.length ? ` · ${formatMoney(usage.billing.rows[0].month, usage.billing.rows[0].currency)}` : '';
+  statusBar.text = `$(pulse) Vertex: ${formatCompact(input)} in / ${formatCompact(outputTokens)} out${cost}`;
   statusBar.tooltip = buildTooltip(usage, total);
   statusBar.command = 'vertexTokenMonitor.refresh';
 }
@@ -315,8 +439,42 @@ function buildTooltip(usage, total) {
     tooltip.appendMarkdown('\n');
   }
 
+  appendBillingMarkdown(tooltip, usage.billing);
+
   tooltip.appendMarkdown('_Click to refresh. Counts all matching Vertex publisher-model traffic in this project._');
   return tooltip;
+}
+
+function appendBillingMarkdown(tooltip, billing) {
+  tooltip.appendMarkdown('**Cloud Billing (actual cost)**  \n');
+  if (!billing) {
+    tooltip.appendMarkdown(
+      '_Not configured. Set `vertexTokenMonitor.billingExportTable` to your BigQuery billing export table._\n\n'
+    );
+    return;
+  }
+  if (billing.error) {
+    tooltip.appendMarkdown(`_${billing.error.replace(/[_*`]/g, ' ')}_\n\n`);
+    return;
+  }
+  if (!billing.rows.length) {
+    tooltip.appendMarkdown('_No billed usage exported yet this month._\n\n');
+    return;
+  }
+
+  for (const row of billing.rows) {
+    tooltip.appendMarkdown(`**Today:** ${formatMoney(row.today, row.currency)}  \n`);
+    tooltip.appendMarkdown(
+      `**This month:** ${formatMoney(row.month, row.currency)}` +
+        (row.monthGross !== row.month ? ` (${formatMoney(row.monthGross, row.currency)} before credits)` : '') +
+        '  \n'
+    );
+  }
+  const through = billing.rows.map((row) => row.dataThrough).filter(Boolean).sort((a, b) => b - a)[0];
+  if (through) {
+    tooltip.appendMarkdown(`**Billing data through:** ${through.toLocaleString()}  \n`);
+  }
+  tooltip.appendMarkdown('_Billing export lags real time by hours, so recent usage may not be priced yet._\n\n');
 }
 
 function showDetails() {
@@ -327,13 +485,22 @@ function showDetails() {
 
   const { input, output: outputTokens, other } = latestUsage.totals;
   const total = input + outputTokens + other;
+  const billing = latestUsage.billing;
+  const billingLines = billing?.rows?.length
+    ? billing.rows.map(
+        (row) =>
+          `Cost today: ${formatMoney(row.today, row.currency)}, this month: ${formatMoney(row.month, row.currency)}`
+      )
+    : [];
   const message = [
     `Project: ${latestUsage.projectId}`,
     `Input: ${formatExact(input)}`,
     `Output: ${formatExact(outputTokens)}`,
     other > 0n ? `Other: ${formatExact(other)}` : null,
     `Total: ${formatExact(total)}`,
-    `Since: ${latestUsage.start.toLocaleString()}`
+    `Since: ${latestUsage.start.toLocaleString()}`,
+    ...billingLines,
+    billing?.error ? `Billing: ${billing.error}` : null
   ]
     .filter(Boolean)
     .join(' • ');
@@ -347,6 +514,14 @@ function showDetails() {
 
 function formatExact(value) {
   return value.toLocaleString();
+}
+
+function formatMoney(amount, currency) {
+  try {
+    return new Intl.NumberFormat(undefined, { style: 'currency', currency }).format(amount);
+  } catch {
+    return `${amount.toFixed(2)} ${currency}`;
+  }
 }
 
 function formatCompact(value) {
@@ -380,6 +555,15 @@ function inlineCode(value) {
 function friendlyError(error) {
   const message = String(error?.message || error || 'Unknown error');
 
+  if (error?.source === 'billing') {
+    if (error?.statusCode === 403 || /permission|PERMISSION_DENIED/i.test(message)) {
+      return `${message} The account needs roles/bigquery.jobUser on the query project and roles/bigquery.dataViewer on the billing export dataset.`;
+    }
+    if (error?.statusCode === 404 || /not found/i.test(message)) {
+      return `${message} Check vertexTokenMonitor.billingExportTable (and billingQueryProjectId).`;
+    }
+    return message;
+  }
   if (error?.code === 'ENOENT' || /not recognized|not found|cannot find/i.test(message)) {
     return 'Google Cloud CLI (gcloud) was not found. Install it or set vertexTokenMonitor.gcloudPath.';
   }
