@@ -6,13 +6,22 @@ const { execFile } = require('child_process');
 
 const METRIC_TYPE = 'aiplatform.googleapis.com/publisher/online_serving/token_count';
 const CONFIG_SECTION = 'vertexTokenMonitor';
+const VERTEX_BILLING_SERVICE = 'services/C7E2-9256-1C43';
+const PRICE_CACHE_KEY = 'priceCatalog';
+const PRICE_CACHE_VERSION = 1;
+const PRICE_CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+// Matches on-demand SKUs such as "Gemini 3.8 Flash Global Text Input Priority - Predictions".
+// Long-context, batch, caching, off-peak and non-text modality SKUs are deliberately not matched.
+const SKU_PATTERN = /^(gemini .+?) (?:(global|regional) )?text (input|output)(?: (priority|flex))? - predictions$/;
 
+let extensionContext;
 let statusBar;
 let refreshTimer;
 let latestUsage;
 let output;
 
 function activate(context) {
+  extensionContext = context;
   output = vscode.window.createOutputChannel('Vertex AI Token Monitor');
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
   statusBar.command = 'vertexTokenMonitor.refresh';
@@ -64,7 +73,8 @@ async function refresh(notifyOnError) {
   try {
     const projectId = await resolveProjectId();
     const accessToken = await getAccessToken();
-    const usage = await queryTodayUsage(projectId, accessToken);
+    const pricing = await loadPricing(accessToken);
+    const usage = await queryTodayUsage(projectId, accessToken, pricing);
     latestUsage = usage;
     renderUsage(usage);
   } catch (error) {
@@ -135,7 +145,125 @@ function runGcloud(args) {
   });
 }
 
-async function queryTodayUsage(projectId, accessToken) {
+async function loadPricing(accessToken) {
+  const config = getConfig();
+  if (!config.get('showSpend', true)) {
+    return undefined;
+  }
+
+  const currency = String(config.get('currency', 'USD') || 'USD').trim().toUpperCase();
+  const cached = extensionContext.globalState.get(PRICE_CACHE_KEY);
+  const cacheUsable = cached?.version === PRICE_CACHE_VERSION && cached.currency === currency;
+  if (cacheUsable && Date.now() - cached.fetchedAt < PRICE_CACHE_MAX_AGE_MS) {
+    return { ...cached, fetchedAt: new Date(cached.fetchedAt) };
+  }
+
+  try {
+    const models = await fetchPriceCatalog(accessToken, currency);
+    const fresh = { version: PRICE_CACHE_VERSION, currency, fetchedAt: Date.now(), models };
+    await extensionContext.globalState.update(PRICE_CACHE_KEY, fresh);
+    return { ...fresh, fetchedAt: new Date(fresh.fetchedAt) };
+  } catch (error) {
+    const message = `Could not load Vertex AI prices: ${friendlyError(error)}`;
+    output.appendLine(`[${new Date().toISOString()}] ${message}`);
+    if (cacheUsable) {
+      return { ...cached, fetchedAt: new Date(cached.fetchedAt), error: message };
+    }
+    return { currency, models: {}, error: message };
+  }
+}
+
+// Downloads list prices for the Vertex AI service from the Cloud Billing Catalog API and keeps
+// only on-demand Gemini text token SKUs, as { modelName: { "location|type|tier": pricePerToken } }.
+async function fetchPriceCatalog(accessToken, currency) {
+  const models = {};
+  let pageToken = '';
+  do {
+    const url = new URL(`https://cloudbilling.googleapis.com/v1/${VERTEX_BILLING_SERVICE}/skus`);
+    url.searchParams.set('currencyCode', currency);
+    url.searchParams.set('pageSize', '5000');
+    if (pageToken) {
+      url.searchParams.set('pageToken', pageToken);
+    }
+
+    const response = await getJson(url, accessToken, 'Cloud Billing Catalog API');
+    for (const sku of Array.isArray(response.skus) ? response.skus : []) {
+      const description = String(sku.description || '').trim().toLowerCase().replace(/\s+/g, ' ');
+      const match = SKU_PATTERN.exec(description);
+      const expression = sku.pricingInfo?.[0]?.pricingExpression;
+      if (!match || expression?.usageUnit !== 'count') {
+        continue;
+      }
+
+      const rates = Array.isArray(expression.tieredRates) ? expression.tieredRates : [];
+      const rate = rates[rates.length - 1]?.unitPrice;
+      if (!rate) {
+        continue;
+      }
+      const unitPrice = Number(rate.units || 0) + Number(rate.nanos || 0) / 1e9;
+      const perToken = unitPrice / (Number(expression.baseUnitConversionFactor) || 1);
+
+      const [, modelName, location = '', tokenType, tier = ''] = match;
+      for (const name of expandSkuModelName(modelName)) {
+        models[name] = models[name] || {};
+        models[name][`${location}|${tokenType}|${tier}`] = perToken;
+      }
+    }
+
+    pageToken = response.nextPageToken || '';
+  } while (pageToken);
+
+  if (!Object.keys(models).length) {
+    throw new Error('No Gemini token prices were found in the Cloud Billing catalog.');
+  }
+  return models;
+}
+
+// SKU names sometimes cover several versions, e.g. "gemini 3.0 / 3.1 pro".
+function expandSkuModelName(name) {
+  const match = /^(.*?)(\S+(?: \/ \S+)+)(.*)$/.exec(name);
+  const names = match ? match[2].split(' / ').map((version) => match[1] + version + match[3]) : [name];
+  return names.map(normalizeModelName);
+}
+
+// Maps both metric model IDs ("gemini-3.8-flash-preview-09-2026") and SKU model names
+// ("gemini 3.8 flash") to a common form.
+function normalizeModelName(name) {
+  const words = String(name)
+    .toLowerCase()
+    .split(/[\s_-]+/)
+    .filter(Boolean)
+    .map((word) => word.replace(/^(\d+)\.0$/, '$1'));
+  const suffixStart = words.findIndex((word, index) => index > 0 && /^(preview|exp|latest)$/.test(word));
+  if (suffixStart > 0) {
+    words.length = suffixStart;
+  }
+  if (words.length > 1 && /^\d{3}$/.test(words[words.length - 1])) {
+    words.pop();
+  }
+  return words.join(' ');
+}
+
+function pricePerToken(pricing, resource, metricLabels, tokenType) {
+  if (!pricing?.models || (tokenType !== 'input' && tokenType !== 'output')) {
+    return undefined;
+  }
+  // Provisioned Throughput ("dedicated") traffic is prepaid rather than billed per token.
+  if (metricLabels.request_type && metricLabels.request_type !== 'shared') {
+    return undefined;
+  }
+
+  const sharedType = String(metricLabels.shared_request_type || 'standard').toLowerCase();
+  const tier = sharedType === 'standard' ? '' : sharedType;
+  const location = resource.location === 'global' ? 'global' : 'regional';
+  const prices = pricing.models[normalizeModelName(resource.model_user_id || '')];
+  if (!prices) {
+    return undefined;
+  }
+  return prices[`${location}|${tokenType}|${tier}`] ?? prices[`|${tokenType}|${tier}`];
+}
+
+async function queryTodayUsage(projectId, accessToken, pricing) {
   const end = new Date();
   const start = new Date(end);
   start.setHours(0, 0, 0, 0);
@@ -150,7 +278,9 @@ async function queryTodayUsage(projectId, accessToken) {
   const totals = {
     input: 0n,
     output: 0n,
-    other: 0n
+    other: 0n,
+    cost: 0,
+    unpriced: 0n
   };
   const models = new Map();
 
@@ -190,10 +320,25 @@ async function queryTodayUsage(projectId, accessToken) {
           publisher,
           input: 0n,
           output: 0n,
-          other: 0n
+          other: 0n,
+          cost: 0,
+          unpriced: 0n
         });
       }
-      models.get(modelKey)[bucket] += amount;
+      const model = models.get(modelKey);
+      model[bucket] += amount;
+
+      if (pricing) {
+        const price = pricePerToken(pricing, resource, series.metric?.labels || {}, bucket);
+        if (price === undefined) {
+          model.unpriced += amount;
+          totals.unpriced += amount;
+        } else {
+          const cost = Number(amount) * price;
+          model.cost += cost;
+          totals.cost += cost;
+        }
+      }
     }
 
     pageToken = response.nextPageToken || '';
@@ -204,6 +349,7 @@ async function queryTodayUsage(projectId, accessToken) {
     start,
     end,
     filter,
+    pricing,
     totals,
     models: [...models.values()].sort((a, b) => {
       const aTotal = a.input + a.output + a.other;
@@ -232,7 +378,7 @@ function sumPoints(points) {
   return total;
 }
 
-function getJson(url, accessToken) {
+function getJson(url, accessToken, apiName = 'Cloud Monitoring API') {
   return new Promise((resolve, reject) => {
     const request = https.request(
       url,
@@ -253,13 +399,13 @@ function getJson(url, accessToken) {
           try {
             parsed = body ? JSON.parse(body) : {};
           } catch {
-            reject(new Error(`Cloud Monitoring returned invalid JSON (HTTP ${response.statusCode}).`));
+            reject(new Error(`${apiName} returned invalid JSON (HTTP ${response.statusCode}).`));
             return;
           }
 
           if (!response.statusCode || response.statusCode < 200 || response.statusCode >= 300) {
             const apiMessage = parsed?.error?.message || body || `HTTP ${response.statusCode}`;
-            const error = new Error(`Cloud Monitoring API: ${apiMessage}`);
+            const error = new Error(`${apiName}: ${apiMessage}`);
             error.statusCode = response.statusCode;
             reject(error);
             return;
@@ -271,7 +417,7 @@ function getJson(url, accessToken) {
     );
 
     request.setTimeout(20000, () => {
-      request.destroy(new Error('Cloud Monitoring request timed out.'));
+      request.destroy(new Error(`${apiName} request timed out.`));
     });
     request.on('error', reject);
     request.end();
@@ -283,8 +429,32 @@ function renderUsage(usage) {
   const total = input + outputTokens + other;
 
   statusBar.text = `$(pulse) Vertex: ${formatCompact(input)} in / ${formatCompact(outputTokens)} out`;
+  if (usage.pricing) {
+    statusBar.text += ` · ${formatSpend(usage)}`;
+  }
   statusBar.tooltip = buildTooltip(usage, total);
   statusBar.command = 'vertexTokenMonitor.refresh';
+}
+
+// A trailing "+" means some tokens had no matching price, so the real spend is higher.
+function formatSpend(usage) {
+  const amount = formatMoney(usage.totals.cost, usage.pricing.currency);
+  return usage.totals.unpriced > 0n ? `${amount}+` : amount;
+}
+
+function formatMoney(amount, currency) {
+  const digits = amount > 0 && amount < 1 ? 4 : 2;
+  try {
+    return new Intl.NumberFormat(undefined, {
+      style: 'currency',
+      currency,
+      currencyDisplay: 'narrowSymbol',
+      minimumFractionDigits: 2,
+      maximumFractionDigits: digits
+    }).format(amount);
+  } catch {
+    return `${amount.toFixed(digits)} ${currency}`;
+  }
 }
 
 function buildTooltip(usage, total) {
@@ -298,6 +468,9 @@ function buildTooltip(usage, total) {
     tooltip.appendMarkdown(`**Other:** ${formatExact(usage.totals.other)}  \n`);
   }
   tooltip.appendMarkdown(`**Total:** ${formatExact(total)}  \n`);
+  if (usage.pricing) {
+    tooltip.appendMarkdown(`**Estimated spend:** ${formatSpend(usage)}  \n`);
+  }
   tooltip.appendMarkdown(`**Since:** ${usage.start.toLocaleString()}  \n`);
   tooltip.appendMarkdown(`**Refreshed:** ${usage.refreshedAt.toLocaleTimeString()}\n\n`);
 
@@ -305,14 +478,30 @@ function buildTooltip(usage, total) {
     tooltip.appendMarkdown('**By model**  \n');
     for (const model of usage.models.slice(0, 8)) {
       const label = model.versionId ? `${model.modelId}@${model.versionId}` : model.modelId;
-      tooltip.appendMarkdown(
-        `${inlineCode(label)}: ${formatCompact(model.input)} in / ${formatCompact(model.output)} out  \n`
-      );
+      let line = `${inlineCode(label)}: ${formatCompact(model.input)} in / ${formatCompact(model.output)} out`;
+      if (usage.pricing) {
+        line += ` · ${formatMoney(model.cost, usage.pricing.currency)}`;
+        if (model.unpriced > 0n) {
+          line += ` (${formatCompact(model.unpriced)} tokens unpriced)`;
+        }
+      }
+      tooltip.appendMarkdown(`${line}  \n`);
     }
     if (usage.models.length > 8) {
       tooltip.appendMarkdown(`…and ${usage.models.length - 8} more  \n`);
     }
     tooltip.appendMarkdown('\n');
+  }
+
+  if (usage.pricing) {
+    if (usage.pricing.error) {
+      tooltip.appendMarkdown(`$(warning) ${escapeMarkdown(usage.pricing.error)}\n\n`);
+    }
+    const priceDate = usage.pricing.fetchedAt ? ` as of ${usage.pricing.fetchedAt.toLocaleDateString()}` : '';
+    tooltip.appendMarkdown(
+      `_Spend is an estimate from Cloud Billing list prices${priceDate}: standard text rates, ` +
+        'excluding long-context surcharges, context caching, discounts and credits._\n\n'
+    );
   }
 
   tooltip.appendMarkdown('_Click to refresh. Counts all matching Vertex publisher-model traffic in this project._');
@@ -333,6 +522,7 @@ function showDetails() {
     `Output: ${formatExact(outputTokens)}`,
     other > 0n ? `Other: ${formatExact(other)}` : null,
     `Total: ${formatExact(total)}`,
+    latestUsage.pricing ? `Estimated spend: ${formatSpend(latestUsage)}` : null,
     `Since: ${latestUsage.start.toLocaleString()}`
   ]
     .filter(Boolean)
@@ -377,6 +567,10 @@ function inlineCode(value) {
   return `\`${String(value).replace(/`/g, "'")}\``;
 }
 
+function escapeMarkdown(value) {
+  return String(value).replace(/[\\`*_{}[\]()#+\-.!<>|~$]/g, '\\$&');
+}
+
 function friendlyError(error) {
   const message = String(error?.message || error || 'Unknown error');
 
@@ -389,8 +583,9 @@ function friendlyError(error) {
   if (error?.statusCode === 403 || /permission|PERMISSION_DENIED/i.test(message)) {
     return `${message} The account needs permission to read Cloud Monitoring time series (for example roles/monitoring.viewer).`;
   }
-  if (/SERVICE_DISABLED|has not been used|Monitoring API/i.test(message) && /disabled|enable/i.test(message)) {
-    return `${message} Enable monitoring.googleapis.com for the project.`;
+  if (/SERVICE_DISABLED|has not been used|Monitoring API|Billing/i.test(message) && /disabled|enable/i.test(message)) {
+    const api = /billing/i.test(message) ? 'cloudbilling.googleapis.com' : 'monitoring.googleapis.com';
+    return `${message} Enable ${api} for the project.`;
   }
   return message;
 }

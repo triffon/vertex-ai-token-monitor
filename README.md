@@ -48,9 +48,30 @@ That invokes `npx @vscode/vsce package` and creates a `.vsix` file. In VS Code:
 
 Example:
 
-`Vertex: 1.4M in / 84.2K out`
+`Vertex: 1.4M in / 84.2K out · $3.21`
 
 Hover for exact totals and a per-model breakdown. Click the status item to refresh immediately.
+
+## Estimated spend
+
+Spend is calculated as token count × list price. Prices come from Google's official
+[Cloud Billing Catalog API](https://cloud.google.com/billing/docs/how-to/get-pricing-information-api)
+(Vertex AI service SKUs), are cached locally and re-downloaded once a day.
+
+Each Cloud Monitoring series is matched to the SKU for its model, location (`global` vs regional) and
+request tier (standard, priority, flex). For example, `gemini-3.8-flash` input on `global` uses
+the SKU *Gemini 3.8 Flash Global Text Input - Predictions*.
+
+It is an **estimate**, not your invoice:
+
+- only Gemini text input/output SKUs are matched; long-context surcharges, context caching, grounding,
+  and non-text modalities are not accounted for;
+- negotiated discounts, committed-use and free-tier credits are not applied;
+- tokens that could not be priced (other publishers such as Anthropic, Provisioned Throughput traffic,
+  or models missing from the catalog) are listed in the tooltip, and the total is shown with a `+`
+  (e.g. `$3.21+`) to indicate the real amount is higher.
+
+For exact billed costs, use Cloud Billing reports or the billing export to BigQuery.
 
 Command Palette commands:
 
@@ -64,7 +85,9 @@ Command Palette commands:
   "vertexTokenMonitor.projectId": "my-project-id",
   "vertexTokenMonitor.refreshMinutes": 5,
   "vertexTokenMonitor.gcloudPath": "gcloud",
-  "vertexTokenMonitor.extraFilter": ""
+  "vertexTokenMonitor.extraFilter": "",
+  "vertexTokenMonitor.showSpend": true,
+  "vertexTokenMonitor.currency": "USD"
 }
 ```
 
@@ -91,7 +114,8 @@ Do not assume this can isolate Antigravity specifically: the documented token me
 The source is deliberately small. It:
 
 - runs only `gcloud config get-value project` and `gcloud auth print-access-token`;
-- sends the resulting OAuth access token only to `https://monitoring.googleapis.com`;
+- sends the resulting OAuth access token only to `https://monitoring.googleapis.com` and, when
+  `showSpend` is enabled, `https://cloudbilling.googleapis.com` (public price catalog);
 - makes no other network requests;
 - reads no workspace files or Antigravity files;
 - has no runtime third-party dependencies.

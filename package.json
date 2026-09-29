@@ -2,7 +2,7 @@
   "name": "vertex-ai-token-monitor",
   "displayName": "Vertex AI Token Monitor",
   "description": "Shows today's Vertex AI publisher-model input/output token usage in the VS Code status bar using Google Cloud Monitoring.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "triffon",
   "license": "MIT",
   "repository": {
@@ -63,6 +63,16 @@
           "type": "string",
           "default": "",
           "markdownDescription": "Optional additional Cloud Monitoring filter appended to the Vertex token metric filter. Example: `resource.labels.model_user_id=\"gemini-2.5-pro\"`. Leave blank to count all Vertex publisher-model traffic in the project."
+        },
+        "vertexTokenMonitor.showSpend": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show estimated spend, calculated from token counts and Vertex AI list prices loaded from the Cloud Billing Catalog API (refreshed daily)."
+        },
+        "vertexTokenMonitor.currency": {
+          "type": "string",
+          "default": "USD",
+          "description": "ISO 4217 currency code for estimated spend, e.g. USD or EUR."
         }
       }
     }
