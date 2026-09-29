@@ -3,8 +3,12 @@
   "displayName": "Vertex AI Token Monitor",
   "description": "Shows today's Vertex AI publisher-model input/output token usage in the VS Code status bar using Google Cloud Monitoring.",
   "version": "0.1.0",
-  "publisher": "ttrifonov",
+  "publisher": "triffon",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/triffon/vertex-ai-token-monitor.git"
+  },
   "engines": {
     "vscode": ">=1.90.0"
   },
