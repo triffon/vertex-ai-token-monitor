@@ -291,7 +291,7 @@ function buildTooltip(usage, total) {
   const tooltip = new vscode.MarkdownString(undefined, true);
   tooltip.isTrusted = false;
   tooltip.appendMarkdown('### Vertex AI tokens today\n\n');
-  tooltip.appendMarkdown(`**Project:** \`${escapeMarkdown(usage.projectId)}\`  \n`);
+  tooltip.appendMarkdown(`**Project:** ${inlineCode(usage.projectId)}  \n`);
   tooltip.appendMarkdown(`**Input:** ${formatExact(usage.totals.input)}  \n`);
   tooltip.appendMarkdown(`**Output:** ${formatExact(usage.totals.output)}  \n`);
   if (usage.totals.other > 0n) {
@@ -306,7 +306,7 @@ function buildTooltip(usage, total) {
     for (const model of usage.models.slice(0, 8)) {
       const label = model.versionId ? `${model.modelId}@${model.versionId}` : model.modelId;
       tooltip.appendMarkdown(
-        `\`${escapeMarkdown(label)}\`: ${formatCompact(model.input)} in / ${formatCompact(model.output)} out  \n`
+        `${inlineCode(label)}: ${formatCompact(model.input)} in / ${formatCompact(model.output)} out  \n`
       );
     }
     if (usage.models.length > 8) {
@@ -372,8 +372,9 @@ function formatCompact(value) {
   return `${sign}${n}`;
 }
 
-function escapeMarkdown(value) {
-  return String(value).replace(/([\\`*_{}\[\]()#+\-.!])/g, '\\$1');
+// Backslash escapes are shown literally inside code spans, so only neutralise backticks.
+function inlineCode(value) {
+  return `\`${String(value).replace(/`/g, "'")}\``;
 }
 
 function friendlyError(error) {
